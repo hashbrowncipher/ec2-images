@@ -60,11 +60,48 @@ ExecStart=ssh-keygen -q -f /var/lib/ssh/ssh_host_ed25519_key -N '' -t ed25519
 RemainAfterExit=yes
 """
 
+# WithoutRA speeds up the address acquisition process by not waiting for an inbound RA
+# packet before performing DHCP.
 ENA_UNIT = """[Match]
 Driver=ena
 
 [Network]
 DHCP=yes
+
+[DHCPv4]
+UseHostname=no
+
+[DHCPv6]
+WithoutRA=solicit
+"""
+
+HOSTNAME_UNIT = """[Unit]
+After=cloud-config.target
+Wants=cloud-config.target
+
+[Service]
+ExecStart=/bin/bash -c 'hostname $(cloud-init query v1.instance_id)'
+Type=oneshot
+RemainAfterExit=yes
+"""
+
+CLOUD_CFG = """
+network:
+  config: disabled
+
+cloud_init_modules:
+ - bootcmd
+ - write-files
+ - growpart
+ - resizefs
+ - disk_setup
+ - mounts
+ - rsyslog
+
+cloud_config_modules:
+# Emit the cloud config ready event
+# this can be used by upstart jobs for 'start on cloud-config'.
+ - runcmd
 """
 
 def roundupMiB(x: int) -> int:
@@ -133,22 +170,20 @@ def run(*args, **kwargs):
     return subprocess.run(*args, **kwargs)
 
 
-def set_up_boot(raw_image, boot_partuuid):
+def set_up_boot(raw_image, root_partuuid, boot_partuuid):
     boot_dir = abspath("image/boot")
 
     with attach_image_loopback(raw_image) as loopdev:
         run(["mkfs.ext4", f"{loopdev}p3"])
 
-        script = f"""
-        #!/bin/bash
+        script = dedent(f"""#!/bin/bash
         set -o errexit
         set -o nounset
         set -o pipefail
         mount /dev/disk/by-partuuid/{boot_partuuid} /boot
         cp -a /mnt/* /boot
         grub-install {loopdev}
-        """.encode("utf-8")
-
+        """).encode("utf-8")
 
         run([
             "systemd-nspawn",
@@ -203,8 +238,8 @@ def mask_service(name):
 
 
 def set_up_overlay():
-    Path("image/etc/sysctl.d/50-dad.conf").write_text("net.ipv6.conf.ens5.accept_dad = 0\n")
     Path("image/etc/systemd/network/ena.network").write_text(ENA_UNIT)
+    Path("image/etc/cloud/cloud.cfg.d/50_custom.cfg").write_text(CLOUD_CFG)
     Path("image/etc/systemd/system/multi-user.target.wants/systemd-networkd.service").symlink_to("/lib/systemd/system/systemd-networkd.service")
     Path("image/root/.ssh").mkdir()
     Path("image/root/.ssh/authorized_keys").write_text("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKr4DFWVEoLCTgjtzl3wT+JnYnDojJAS/4hsFww4n/R8 josh@ubuntu\n")
@@ -223,16 +258,21 @@ def set_up_overlay():
     overlay_script_path.write_text(OVERLAY_SCRIPT)
     overlay_script_path.chmod(0o755)
 
-    overlay_unit_path = Path("image/etc/systemd/system/overlays.service")
-    overlay_unit_path.write_text(OVERLAY_UNIT)
-
     units = "image/etc/systemd/system/"
+
+    overlay_unit_path = Path(f"{units}/overlays.service")
+    overlay_unit_path.write_text(OVERLAY_UNIT)
+    Path(f"{units}/sysinit.target.wants/overlays.service").symlink_to("/etc/systemd/system/overlays.service")
+
+    hostname_unit_path = Path(f"{units}/hostname.service")
+    hostname_unit_path.write_text(HOSTNAME_UNIT)
+    Path(f"{units}/multi-user.target.wants/hostname.service").symlink_to("/etc/systemd/system/hostname.service")
+
     Path(f"{units}/ssh-keygen.service").write_text(SSH_KEYGEN_UNIT)
     Path(f"{units}/ssh.service.requires").mkdir()
     Path(f"{units}/ssh.service.requires/ssh-keygen.service").symlink_to("/etc/systemd/system/ssh-keygen.service")
 
-    Path("image/etc/systemd/system/sysinit.target.wants/overlays.service").symlink_to(overlay_unit_path)
-
+    mask_service("grub-common")
     mask_service("grub-initrd-fallback")
     mask_service("cloud-init-local")
 
@@ -241,16 +281,22 @@ def main():
     run([
         "mkosi",
         "--repositories", "main,universe",
+        "-d", "ubuntu",
+        # groovy has systemd 246, which has WithoutRA
+        "-r", "groovy",
         "-t", "directory",
-        "-p grub-pc",
-        "-p linux-image-aws",
-        "-p initramfs-tools",
         "-p cloud-init",
         "-p openssh-server",
         "-p lsb-release",
         "-p less",
         "-p nginx-light",
         "-p tcpdump",
+        "-p linux-image-aws",
+        "-p grub-pc",
+        "-p initramfs-tools",
+        "-p python3-pip",
+        "-p python3-venv",
+        "-p vim-nox",
         "--debug", "run",
     ])
     change_passwords("image")
@@ -265,7 +311,7 @@ def main():
     Path("image/boot/grub/grub.cfg").write_text(
         dedent(f"""\
         echo 'GRUB booting'
-        linux /vmlinuz root=PARTUUID={root_partuuid} ro console=tty0 console=ttyS0,115200n8 noresume
+        linux /vmlinuz root=PARTUUID={root_partuuid} ro console=tty0 console=ttyS0,115200n8 noresume sysctl.net.ipv6.conf.default.accept_dad=0 sysctl.net.ipv6.conf.all.accept_dad=0
         initrd /initrd.img
         boot
         """
@@ -281,7 +327,7 @@ def main():
         "-e", "boot/*"
     ])
     inlay_disk(root_partuuid, boot_partuuid, squashfs_image, outfile)
-    set_up_boot(outfile, boot_partuuid)
+    set_up_boot(outfile, root_partuuid, boot_partuuid)
     compress_product(outfile)
 
 
