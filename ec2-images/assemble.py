@@ -11,7 +11,11 @@ from contextlib import contextmanager
 from subprocess import PIPE
 from pathlib import Path
 from textwrap import dedent
+from textwrap import dedent as dd
+from tempfile import TemporaryDirectory
 import os
+from os import chdir
+from os import makedirs
 from glob import glob
 from os.path import abspath
 from os.path import basename
@@ -28,6 +32,7 @@ SECTOR = 512
 MB = 1024 * 1024
 GB = 1024 * 1024 * 1024
 FOOTER_SECTORS = 34
+ESP_SECTORS = 409600
 
 OVERLAY_SCRIPT = """#!/bin/bash
 set -o errexit
@@ -120,6 +125,21 @@ def copy(in_fh, out_fh):
         out_fh.write(data)
 
 
+def format_disk(esp_uuid, root_partuuid, outfile):
+    with open(outfile, "wb") as out_fh:
+        out_fh.truncate(GB)
+
+    remaining = GB // SECTOR - (2048 + ESP_SECTORS + FOOTER_SECTORS)
+    table = [
+        "label: gpt",
+        "first-lba: 2048",
+        f'size={ESP_SECTORS}, uuid={esp_uuid}, type=c12a7328-f81f-11d2-ba4b-00a0c93ec93b, name="EFI System Partition"',
+        f'size={remaining}, uuid={root_partuuid}, type=0fc63daf-8483-4772-8e79-3d69d8477de4, name="State Partition"',
+    ]
+
+    run(["sfdisk", "--color=never", outfile], input='\n'.join(table).encode('utf-8'))
+
+
 def inlay_disk(root_partuuid, esp_uuid, filename, outfile):
     """Embed the squashfs into a GPT disklabel.
 
@@ -129,26 +149,7 @@ def inlay_disk(root_partuuid, esp_uuid, filename, outfile):
     traditional bootloader.
     """
 
-    esp_sectors = 409600
-    blob_sectors = roundupMiB(os.stat(filename).st_size) // SECTOR
-    remaining = GB // SECTOR - (2048 + esp_sectors + blob_sectors + FOOTER_SECTORS)
 
-    with open(outfile, "wb") as out_fh:
-        out_fh.truncate(GB)
-
-        table = [
-            "label: gpt",
-            "first-lba: 2048",
-            f'size={esp_sectors}, uuid={esp_uuid}, type=c12a7328-f81f-11d2-ba4b-00a0c93ec93b, name="EFI System Partition"',
-            f'size={blob_sectors}, uuid={root_partuuid}, type=0fc63daf-8483-4772-8e79-3d69d8477de4, name="Root Partition"',
-            f'size={remaining}, type=0fc63daf-8483-4772-8e79-3d69d8477de4, name="Root Partition"',
-        ]
-
-        run(["sfdisk", "--color=never", outfile], input='\n'.join(table).encode('utf-8'))
-
-        out_fh.seek((2048 + esp_sectors) * SECTOR)
-        with open(filename, "rb") as blob:
-            copy(blob, out_fh)
 
 
 @contextmanager
@@ -166,36 +167,42 @@ def run(*args, **kwargs):
     kwargs.setdefault("check", True)
     return subprocess.run(*args, **kwargs)
 
+@contextmanager
+def mountedcwd(device):
+    with TemporaryDirectory(dir=".") as mountpoint:
+        run(["mount", device, mountpoint])
+        chdir(mountpoint)
+        try:
+            yield
+        finally:
+            chdir("..")
+            run(["umount", mountpoint])
+
 
 def set_up_boot(raw_image, root_partuuid, esp_uuid):
     boot_dir = abspath("image/boot")
 
     with attach_image_loopback(raw_image) as loopdev:
         run(["mkfs.vfat", f"{loopdev}p1"])
+        with mountedcwd(f"{loopdev}p1"):
+            makedirs("loader/entries")
+            Path("loader/entries/ubuntu.conf").write_text(dd(f"""\
+            title   Ubuntu 21.04
+            linux   /vmlinuz
+            initrd  /initrd.img
+            options root=PARTUUID={root_partuuid} loop=root.squashfs console=ttyS0 quiet
+            """))
 
-        script = dedent(f"""\
-        #!/bin/bash
-        set -o errexit
-        set -o nounset
-        set -o pipefail
-        mkdir -p /efi/EFI/boot /efi/loader/entries
-        cat <<EOF > /efi/loader/entries/ubuntu.conf
-        title   Ubuntu 21.04
-        linux   /vmlinuz
-        initrd  /initrd.img
-        options root=PARTUUID={root_partuuid} rw console=ttyS0 quiet
-        EOF
-        cp /usr/lib/systemd/boot/efi/systemd-bootx64.efi /efi/EFI/boot/bootx64.efi
-        cp /mnt/* /efi
-        """).encode("utf-8")
+            makedirs("EFI/boot")
+            copyfile("/usr/lib/systemd/boot/efi/systemd-bootx64.efi", "EFI/boot/bootx64.efi")
 
-        cwd = os.getcwd()
-        run([
-            "systemd-nspawn",
-            "-i", loopdev,
-            f"--bind-ro={cwd}/boot:/mnt",
-            "--pipe",
-        ], input=script)
+            for name in glob("../boot/*"):
+                copyfile(name, basename(name))
+                os.remove(name)
+
+        run(["mkfs.ext4", f"{loopdev}p2"])
+        with mountedcwd(f"{loopdev}p2"):
+            copyfile("../image.squashfs", "root.squashfs")
 
 
 def rm_f(filename):
@@ -272,7 +279,6 @@ def set_up_overlay():
     Path(f"{units}/ssh.service.requires").mkdir()
     Path(f"{units}/ssh.service.requires/ssh-keygen.service").symlink_to("/etc/systemd/system/ssh-keygen.service")
 
-    mask_service("cloud-init-local")
 
 def extract_kernel():
     run([
@@ -305,6 +311,8 @@ def main():
         "-p openssh-server",
         "-p lsb-release",
         "-p less",
+        "-p curl",
+        "-p jq",
         "-p nginx-light",
         "-p tcpdump",
         "-p initramfs-tools",
@@ -324,7 +332,7 @@ def main():
         "-wildcards",
         "-e", "boot/*"
     ])
-    inlay_disk(root_partuuid, esp_uuid, squashfs_image, outfile)
+    format_disk(root_partuuid, esp_uuid, outfile)
     set_up_boot(outfile, root_partuuid, esp_uuid)
     compress_product(outfile)
 
