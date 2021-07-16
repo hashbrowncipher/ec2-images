@@ -49,11 +49,10 @@ RemainAfterExit=yes
 IMDS_UNIT = """\
 [Unit]
 After=network.target
-StandardOutput=file:/run/instance-identity
 
 [Service]
 Type=oneshot
-ExecStart=curl -v --retry 2 169.254.169.254/latest/dynamic/instance-identity/document
+ExecStart=bash -c 'exec curl --no-progress-meter -v --retry 2 169.254.169.254/latest/dynamic/instance-identity/document > /run/instance-identity'
 RemainAfterExit=yes
 """
 
@@ -63,7 +62,7 @@ Requires=imds.service
 
 [Service]
 Type=oneshot
-ExecStart=hostname $(jq -r ".instanceId" /run/instance-identity)
+ExecStart=bash -c 'hostname $(jq -r ".instanceId" /run/instance-identity)'
 RemainAfterExit=yes
 """
 
@@ -351,6 +350,8 @@ def main():
         "-p python3-pip",
         "-p python3-venv",
         "-p vim-nox",
+        "-p man-db",
+        "-p manpages",
         # This will get installed as a dependency of the kernel
         # We don't want it. We need to install it now so that we can disable it.
         "-p intel-microcode",
