@@ -34,28 +34,6 @@ GB = 1024 * 1024 * 1024
 FOOTER_SECTORS = 34
 ESP_SECTORS = 409600
 
-OVERLAY_SCRIPT = """#!/bin/bash
-set -o errexit
-set -o nounset
-set -o pipefail
-
-mkdir /run/overlay
-cd /run/overlay
-mkdir var var.work
-mount -t overlay -o lowerdir=/var,upperdir=var,workdir=var.work none /var
-"""
-
-OVERLAY_UNIT = """[Unit]
-Description=Mount overlay fses
-DefaultDependencies=no
-After=local-fs.target
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/sbin/mount-overlay
-RemainAfterExit=yes
-"""
-
 SSH_KEYGEN_UNIT = """[Unit]
 Description=Create SSH host key
 Before=ssh.service
@@ -65,6 +43,27 @@ ConditionPathExists=!/var/lib/ssh/ssh_host_ed25519
 Type=oneshot
 ExecStart=mkdir /var/lib/ssh
 ExecStart=ssh-keygen -q -f /var/lib/ssh/ssh_host_ed25519_key -N '' -t ed25519
+RemainAfterExit=yes
+"""
+
+IMDS_UNIT = """\
+[Unit]
+After=network.target
+StandardOutput=file:/run/instance-identity
+
+[Service]
+Type=oneshot
+ExecStart=curl -v --retry 2 169.254.169.254/latest/dynamic/instance-identity/document
+RemainAfterExit=yes
+"""
+
+HOSTNAME_UNIT = """\
+[Unit]
+Requires=imds.service
+
+[Service]
+Type=oneshot
+ExecStart=hostname $(jq -r ".instanceId" /run/instance-identity)
 RemainAfterExit=yes
 """
 
@@ -83,37 +82,28 @@ UseHostname=no
 WithoutRA=solicit
 """
 
-HOSTNAME_UNIT = """[Unit]
-After=cloud-config.target
-Wants=cloud-config.target
+MODULES_HOOK = """\
+#!/bin/sh
 
-[Service]
-ExecStart=/bin/bash -c 'hostname $(cloud-init query v1.instance_id)'
-Type=oneshot
-RemainAfterExit=yes
+PREREQ=""
+
+prereqs()
+{
+  echo "$PREREQ"
+}
+
+case $1 in
+# get pre-requisites
+prereqs)
+  prereqs
+  exit 0
+  ;;
+esac
+
+. /usr/share/initramfs-tools/hook-functions
+
+manual_add_modules overlay
 """
-
-CLOUD_CFG = """\
-network:
-  config: disabled
-
-cloud_init_modules:
- - bootcmd
- - write-files
- - growpart
- - resizefs
- - disk_setup
- - mounts
- - rsyslog
-
-cloud_config_modules:
-# Emit the cloud config ready event
-# this can be used by upstart jobs for 'start on cloud-config'.
- - runcmd
-"""
-
-def roundupMiB(x: int) -> int:
-    return (x + 1048575) & ~1048575
 
 
 def copy(in_fh, out_fh):
@@ -138,17 +128,6 @@ def format_disk(esp_uuid, root_partuuid, outfile):
     ]
 
     run(["sfdisk", "--color=never", outfile], input='\n'.join(table).encode('utf-8'))
-
-
-def inlay_disk(root_partuuid, esp_uuid, filename, outfile):
-    """Embed the squashfs into a GPT disklabel.
-
-    Ideally we'd use EFI to boot kernel images directly, skipping the bootloader
-    entirely. So we'd use something like mkosi's gpt_squashfs output format and have
-    a small vfat partition to contain it all. EC2 still uses BIOS boot, so we need a
-    traditional bootloader.
-    """
-
 
 
 
@@ -190,7 +169,7 @@ def set_up_boot(raw_image, root_partuuid, esp_uuid):
             title   Ubuntu 21.04
             linux   /vmlinuz
             initrd  /initrd.img
-            options root=PARTUUID={root_partuuid} loop=root.squashfs console=ttyS0 quiet
+            options root=PARTUUID={root_partuuid} loop=root.squashfs console=ttyS0 break=premount verbose
             """))
 
             makedirs("EFI/boot")
@@ -241,14 +220,21 @@ def change_passwords(image):
 def mask_service(name):
     Path(f"image/etc/systemd/system/{name}.service").symlink_to("/dev/null")
 
+def make_unit(name, contents, *, symlink="multi-user.target.wants"):
+    units = "image/etc/systemd/system/"
+    unit_file = Path(f"{units}/{name}")
 
-def set_up_overlay():
+    unit_file.write_text(contents)
+    if symlink:
+        Path(f"{units}/{symlink}/{name}").symlink_to(unit_file)
+
+
+def customize_image():
     Path("image/etc/systemd/network/ena.network").write_text(ENA_UNIT)
-    Path("image/etc/cloud/cloud.cfg.d/50_custom.cfg").write_text(CLOUD_CFG)
     Path("image/etc/systemd/system/multi-user.target.wants/systemd-networkd.service").symlink_to("/lib/systemd/system/systemd-networkd.service")
     Path("image/efi").mkdir()
     Path("image/root/.ssh").mkdir()
-    Path("image/root/.ssh/authorized_keys").write_text("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKr4DFWVEoLCTgjtzl3wT+JnYnDojJAS/4hsFww4n/R8 josh@ubuntu\n")
+    Path("image/root/.ssh/authorized_keys").write_text("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKr4DFWVEoLCTgjtzl3wT+JnYnDojJAS/4hsFww4n/R8\n")
 
     for key in glob("image/etc/ssh/ssh_host_*_key"):
         filename = basename(key)
@@ -259,25 +245,16 @@ def set_up_overlay():
         os.remove(key)
 
     Path("image/etc/fstab").write_text("none /tmp tmpfs defaults 0 0\n")
-    Path("image/etc/initramfs-tools/initramfs.conf").write_text("MODULES=dep\nCOMPRESS=lz4\n")
-
-    overlay_script_path = Path("image/usr/local/sbin/mount-overlay")
-    overlay_script_path.write_text(OVERLAY_SCRIPT)
-    overlay_script_path.chmod(0o755)
 
     units = "image/etc/systemd/system/"
-
-    overlay_unit_path = Path(f"{units}/overlays.service")
-    overlay_unit_path.write_text(OVERLAY_UNIT)
-    Path(f"{units}/sysinit.target.wants/overlays.service").symlink_to("/etc/systemd/system/overlays.service")
-
-    hostname_unit_path = Path(f"{units}/hostname.service")
-    hostname_unit_path.write_text(HOSTNAME_UNIT)
-    Path(f"{units}/multi-user.target.wants/hostname.service").symlink_to("/etc/systemd/system/hostname.service")
 
     Path(f"{units}/ssh-keygen.service").write_text(SSH_KEYGEN_UNIT)
     Path(f"{units}/ssh.service.requires").mkdir()
     Path(f"{units}/ssh.service.requires/ssh-keygen.service").symlink_to("/etc/systemd/system/ssh-keygen.service")
+
+    make_unit("imds.service", IMDS_UNIT)
+    make_unit("hostname.service", HOSTNAME_UNIT)
+
 
 
 def extract_kernel():
@@ -294,6 +271,61 @@ def extract_kernel():
     copyfile("image/boot/initrd.img", "boot/initrd.img")
     rmtree("image/boot")
 
+    # apt lists are huge. They aren't costly at runtime (because they don't get 
+    # decompressed until needed), but they make the images bigger and thus slower
+    # to copy back and forth to S3
+    rmtree("image/var/cache/apt")
+    rmtree("image/var/lib/apt/lists")
+
+
+def make_squashfs(squashfs_image):
+    rm_f(squashfs_image)
+    run([
+        "mksquashfs", "image", squashfs_image,
+        "-comp", "zstd", "-processors", "1",
+        "-wildcards",
+        "-e", "boot/*"
+    ])
+
+def write_script(filename, contents):
+    path = Path(filename)
+    path.write_text(contents)
+    path.chmod(0o755)
+
+
+def configure_initramfs(root_partuuid):
+    Path("image/etc/initramfs-tools/initramfs.conf").write_text("MODULES=list\nCOMPRESS=lz4\n")
+
+    overlay_script =dd("""\
+    #!/bin/sh -e
+
+    PREREQ=""
+    prereqs() {
+      echo "$PREREQ"
+    }
+
+    case ${1} in
+      prereqs)
+        prereqs
+        exit 0
+        ;;
+    esac
+
+    mkdir -p /run/overlay
+    cd /run/overlay
+
+    mkdir host immutable-root
+    mount /dev/disk/by-partuuid/""" + root_partuuid + """ host
+    mount -o move /root immutable-root
+    mkdir -p host/state host/work
+    mount -t overlay -o lowerdir=immutable-root,upperdir=host/state,workdir=host/work none /root
+    """)
+    write_script("image/usr/share/initramfs-tools/scripts/init-bottom/overlay", overlay_script)
+    write_script("image/usr/share/initramfs-tools/hooks/copy-modules", MODULES_HOOK)
+
+    # No need for microcode in a cloud guest
+    Path("image/usr/share/initramfs-tools/hooks/intel_microcode").unlink()
+
 
 def main():
     root_partuuid = str(uuid.uuid4())
@@ -303,11 +335,11 @@ def main():
 
     run([
         "mkosi",
+        "--force",
         "--repositories", "main,universe",
         "-d", "ubuntu",
         "-r", "hirsute",
         "-t", "directory",
-        "-p cloud-init",
         "-p openssh-server",
         "-p lsb-release",
         "-p less",
@@ -319,20 +351,19 @@ def main():
         "-p python3-pip",
         "-p python3-venv",
         "-p vim-nox",
+        # This will get installed as a dependency of the kernel
+        # We don't want it. We need to install it now so that we can disable it.
+        "-p intel-microcode",
         "--debug", "run",
     ])
     change_passwords("image")
+    configure_initramfs(root_partuuid)
+    customize_image()
     extract_kernel()
 
-    set_up_overlay()
-    rm_f(squashfs_image)
-    run([
-        "mksquashfs", "image", squashfs_image,
-        "-comp", "zstd", "-processors", "1",
-        "-wildcards",
-        "-e", "boot/*"
-    ])
-    format_disk(root_partuuid, esp_uuid, outfile)
+    make_squashfs(squashfs_image)
+
+    format_disk(esp_uuid, root_partuuid, outfile)
     set_up_boot(outfile, root_partuuid, esp_uuid)
     compress_product(outfile)
 
