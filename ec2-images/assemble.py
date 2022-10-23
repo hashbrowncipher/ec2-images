@@ -5,6 +5,7 @@ Dependencies:
   mksquashfs (squashfs-tools)
   systemd-nspawn (systemd-container)
   lz4 (liblz4-tool)
+  fdisk
 """
 
 from contextlib import contextmanager
@@ -14,6 +15,7 @@ from textwrap import dedent
 from textwrap import dedent as dd
 from tempfile import TemporaryDirectory
 import os
+import hashlib
 from os import chdir
 from os import makedirs
 from glob import glob
@@ -34,14 +36,19 @@ GB = 1024 * 1024 * 1024
 FOOTER_SECTORS = 34
 ESP_SECTORS = 409600
 
+SYSTEMD_CONFIG_UNIT = """\
+[Manager]
+DefaultCPUAccounting=yes
+"""
+
 SSH_KEYGEN_UNIT = """[Unit]
 Description=Create SSH host key
 Before=ssh.service
-ConditionPathExists=!/var/lib/ssh/ssh_host_ed25519
+ConditionPathExists=!/var/lib/ssh/ssh_host_ed25519_key
 
 [Service]
 Type=oneshot
-ExecStart=mkdir /var/lib/ssh
+ExecStart=mkdir -p /var/lib/ssh
 ExecStart=ssh-keygen -q -f /var/lib/ssh/ssh_host_ed25519_key -N '' -t ed25519
 RemainAfterExit=yes
 """
@@ -59,6 +66,7 @@ RemainAfterExit=yes
 HOSTNAME_UNIT = """\
 [Unit]
 Requires=imds.service
+After=imds.service
 
 [Service]
 Type=oneshot
@@ -156,27 +164,39 @@ def mountedcwd(device):
             chdir("..")
             run(["umount", mountpoint])
 
+def hash_pe_coff(fh):
+    hasher = hashlib.sha256()
+    buf = fh.read(216)
+    assert buf[152:154] == b'\x0b\x02' # PE32+ magic number
+    hasher.update(buf)
+    fh.read(4) # Skip the checksum
+    hasher.update(fh.read(76))
+    assert fh.read(8) == b"\x00" * 8 # Security directory is empty
+    while buf := fh.read(4096):
+        hasher.update(buf)
+
+    return hasher.hexdigest()
 
 def set_up_boot(raw_image, root_partuuid, esp_uuid):
-    boot_dir = abspath("image/boot")
+    Path("boot/os-release").write_text('NAME="Ubuntu 22.04"')
+    Path("boot/cmdline").write_text(f"root=PARTUUID={root_partuuid} loop=root.squashfs debug console=ttyS0")
+    run(["objcopy",
+        "--add-section", ".osrel=boot/os-release", "--change-section-vma", ".osrel=0x20000",
+        "--add-section", ".cmdline=boot/cmdline", "--change-section-vma", ".cmdline=0x30000",
+        "--add-section", ".linux=boot/vmlinuz", "--change-section-vma", ".linux=0x2000000",
+        "--add-section", ".initrd=boot/initrd.img", "--change-section-vma", ".initrd=0x3000000",
+        "/usr/lib/systemd/boot/efi/linuxx64.efi.stub",
+        "boot/ubuntu.efi",
+    ])
+    with open("boot/ubuntu.efi", "rb") as fh:
+        digest = hash_pe_coff(fh)
+    print(f"Expected TPM binary hash: {digest}")
 
     with attach_image_loopback(raw_image) as loopdev:
         run(["mkfs.vfat", f"{loopdev}p1"])
         with mountedcwd(f"{loopdev}p1"):
-            makedirs("loader/entries")
-            Path("loader/entries/ubuntu.conf").write_text(dd(f"""\
-            title   Ubuntu 21.04
-            linux   /vmlinuz
-            initrd  /initrd.img
-            options root=PARTUUID={root_partuuid} loop=root.squashfs console=ttyS0 break=premount verbose
-            """))
-
             makedirs("EFI/boot")
-            copyfile("/usr/lib/systemd/boot/efi/systemd-bootx64.efi", "EFI/boot/bootx64.efi")
-
-            for name in glob("../boot/*"):
-                copyfile(name, basename(name))
-                os.remove(name)
+            copyfile("../boot/ubuntu.efi", "EFI/boot/bootx64.efi")
 
         run(["mkfs.ext4", f"{loopdev}p2"])
         with mountedcwd(f"{loopdev}p2"):
@@ -245,21 +265,27 @@ def customize_image():
 
     Path("image/etc/fstab").write_text("none /tmp tmpfs defaults 0 0\n")
 
-    units = "image/etc/systemd/system/"
+    units = "image/etc/systemd/system"
 
+    Path(f"{units}.conf").write_text(SYSTEMD_CONFIG_UNIT)
+    Path(f"{units}/ssh-keygen.service").write_text(SSH_KEYGEN_UNIT)
     Path(f"{units}/ssh-keygen.service").write_text(SSH_KEYGEN_UNIT)
     Path(f"{units}/ssh.service.requires").mkdir()
     Path(f"{units}/ssh.service.requires/ssh-keygen.service").symlink_to("/etc/systemd/system/ssh-keygen.service")
 
     make_unit("imds.service", IMDS_UNIT)
     make_unit("hostname.service", HOSTNAME_UNIT)
+    mask_service("e2scrub_reap")
 
-
+def print_sha256(filename):
+    blob = Path(filename).read_bytes()
+    digest = hashlib.sha256(blob).hexdigest()
+    print(f"sha256({repr(filename)}): {digest}")
 
 def extract_kernel():
     run([
         "systemd-nspawn",
-        "-D", "image",
+        "-D", "image", "--resolv-conf=bind-host",
         "apt-get", "install", "-y", "--no-install-recommends", "linux-image-aws",
     ])
 
@@ -293,7 +319,12 @@ def write_script(filename, contents):
 
 
 def configure_initramfs(root_partuuid):
-    Path("image/etc/initramfs-tools/initramfs.conf").write_text("MODULES=list\nCOMPRESS=lz4\n")
+    # We need our initramfs to do two things:
+    # * loopback-mount our squashfs
+    # * add an r/w overlayfs on top
+    #
+    # The second step is not very critical.
+    Path("image/etc/initramfs-tools/initramfs.conf").write_text("MODULES=list\nCOMPRESS=zstd\n")
 
     overlay_script =dd("""\
     #!/bin/sh -e
@@ -333,11 +364,12 @@ def main():
     squashfs_image = "image.squashfs"
 
     run([
-        "mkosi",
+        "bin/mkosi",
         "--force",
         "--repositories", "main,universe",
+        "--with-docs",
         "-d", "ubuntu",
-        "-r", "hirsute",
+        "-r", "jammy",
         "-t", "directory",
         "-p openssh-server",
         "-p lsb-release",
@@ -352,15 +384,19 @@ def main():
         "-p vim-nox",
         "-p man-db",
         "-p manpages",
+        "-p zstd",
         # This will get installed as a dependency of the kernel
         # We don't want it. We need to install it now so that we can disable it.
         "-p intel-microcode",
         "--debug", "run",
     ])
+    os.chdir("mkosi.output/ubuntu~jammy")
     change_passwords("image")
     configure_initramfs(root_partuuid)
     customize_image()
+    os.rename("image/etc/resolv.conf", "image/etc/resolv.conf.bak")
     extract_kernel()
+    os.rename("image/etc/resolv.conf.bak", "image/etc/resolv.conf")
 
     make_squashfs(squashfs_image)
 
